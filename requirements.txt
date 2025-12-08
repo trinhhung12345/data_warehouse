@@ -1,0 +1,10 @@
+pandas 
+pyarrow
+sqlalchemy
+psycopg2-binary
+pymysql
+geoalchemy2
+geopandas
+redis
+taipy
+plotly
