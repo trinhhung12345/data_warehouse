@@ -165,7 +165,7 @@ def producer():
                 pipeline.execute()
                 
                 r_client.set(LAST_ID_KEY, int(current_max_id))
-                last_id = current_max_id
+                last_id = int(current_max_id)
                 total_pushed += len(df)
                 
                 # --- GIAI ĐOẠN 4: SUCCESS ---
