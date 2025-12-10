@@ -153,7 +153,7 @@ def generate_dashboard(state_data, status_msg, last_error):
 
     # 2. Header Panel
     header = Panel(
-        f"[bold white]DIMENSION SYNC SERVICE[/bold white] | [dim]{datetime.now().strftime('%H:%M:%S')}[/dim]",
+        f"[bold white]DIMENSION SYNC SERVICE[/bold white] | [bold yellow]{datetime.now().strftime('%H:%M:%S')}[/bold yellow]",
         style="magenta", box=box.HEAVY_HEAD
     )
 
