@@ -20,7 +20,7 @@ except:
     pass
 
 # ==============================================================================
-# 1. CÁC HÀM XỬ LÝ LOGIC (KHÔNG ĐỔI)
+# 1. CÁC HÀM LOGIC & LOOKUP
 # ==============================================================================
 
 def get_lookup_map(id_list, table_name, id_col, key_col):
@@ -38,7 +38,7 @@ def get_lookup_map(id_list, table_name, id_col, key_col):
         with engine_dwh.connect() as conn:
             lookup_df = pd.read_sql(sql, conn)
         return dict(zip(lookup_df[id_col].astype(str), lookup_df[key_col]))
-    except Exception as e:
+    except:
         return {}
 
 def get_promo_from_crm(real_trip_ids):
@@ -58,22 +58,20 @@ def get_promo_from_crm(real_trip_ids):
     if not short_ids: return {}
     ids_str = ",".join(short_ids)
     
-    sql = text(f"SELECT trip_id, used_promotion_id FROM trip_feedback WHERE trip_id IN ({ids_str}) AND used_promotion_id IS NOT NULL")
-    
     try:
+        sql = text(f"SELECT trip_id, used_promotion_id FROM trip_feedback WHERE trip_id IN ({ids_str}) AND used_promotion_id IS NOT NULL")
         with engine_crm.connect() as conn:
             df_feedback = pd.read_sql(sql, conn)
         
         if df_feedback.empty: return {}
         
         short_to_promo = dict(zip(df_feedback['trip_id'].astype(str), df_feedback['used_promotion_id'].astype(int).astype(str)))
-        
         final_map = {}
         for rid, sid in mapping_real_to_short.items():
             if sid in short_to_promo:
                 final_map[rid] = short_to_promo[sid]
         return final_map
-    except Exception as e:
+    except:
         return {}
 
 def get_driver_performance(df_batch):
@@ -87,20 +85,16 @@ def get_driver_performance(df_batch):
     drivers_str = ",".join([str(x) for x in drivers if str(x) != 'nan'])
     periods_str = ",".join([f"'{x}'" for x in periods])
     
-    sql = text(f"""
-        SELECT driver_id, period_date, average_rating, acceptance_rate
-        FROM driver_performance
-        WHERE driver_id IN ({drivers_str}) AND period_date IN ({periods_str})
-    """)
-    
     try:
+        sql = text(f"""
+            SELECT driver_id, period_date, average_rating, acceptance_rate
+            FROM driver_performance
+            WHERE driver_id IN ({drivers_str}) AND period_date IN ({periods_str})
+        """)
         with engine_crm.connect() as conn:
             df_perf = pd.read_sql(sql, conn)
         
-        if df_perf.empty:
-            df_batch['AverageRating'] = None
-            df_batch['AcceptanceRate'] = None
-            return df_batch
+        if df_perf.empty: raise Exception("No perf data")
 
         df_perf['period_date'] = pd.to_datetime(df_perf['period_date']).dt.strftime('%Y-%m-%d')
         df_perf['driver_id'] = df_perf['driver_id'].astype(str)
@@ -114,11 +108,34 @@ def get_driver_performance(df_batch):
         df_batch['AcceptanceRate'] = df_batch['join_key'].map(acceptance_map)
         df_batch.drop(columns=['temp_period', 'join_key'], inplace=True, errors='ignore')
         
-    except Exception as e:
+    except:
         df_batch['AverageRating'] = None
         df_batch['AcceptanceRate'] = None
         
     return df_batch
+
+# --- HÀM CHỐNG TRÙNG LẶP (MỚI ĐƯỢC THÊM LẠI) ---
+def filter_existing_trips(df, engine):
+    if df.empty or 'sourcetripid' not in df.columns: return df
+    
+    source_ids = df['sourcetripid'].astype(str).tolist()
+    ids_str = ",".join([f"'{x}'" for x in source_ids])
+    
+    # Chỉ kiểm tra những ID đang chuẩn bị insert
+    sql = f"SELECT SourceTripID FROM FactTrip WHERE SourceTripID IN ({ids_str})"
+    
+    try:
+        with engine.connect() as conn:
+            existing_df = pd.read_sql(sql, conn)
+        
+        existing_ids = set(existing_df['sourcetripid'].astype(str).tolist())
+        
+        if not existing_ids: return df
+        
+        # Lọc bỏ dòng trùng
+        return df[~df['sourcetripid'].astype(str).isin(existing_ids)]
+    except:
+        return df
 
 def process_batch_data(df):
     sample_debug = {}
@@ -198,10 +215,9 @@ def process_batch_data(df):
     return df[available_cols], sample_debug
 
 # ==============================================================================
-# 2. GIAO DIỆN DASHBOARD (RICH) - ĐÃ SỬA LỖI LAYOUT
+# 2. GIAO DIỆN DASHBOARD
 # ==============================================================================
 def generate_dashboard(total, last_rating, last_fare, status, last_error, debug_info):
-    # 1. Bảng Main Stats
     grid = Table.grid(expand=True)
     grid.add_column(justify="center", ratio=1)
     grid.add_column(justify="center", ratio=1)
@@ -213,52 +229,34 @@ def generate_dashboard(total, last_rating, last_fare, status, last_error, debug_
         Panel(f"[bold cyan]${last_fare}[/bold cyan]", title="💰 Avg Fare (Batch)", border_style="cyan"),
     )
 
-    # 2. Bảng Debug ID
     debug_table = Table(show_header=True, expand=True, box=box.SIMPLE)
     debug_table.add_column("Level", style="dim")
     debug_table.add_column("ID / Key", style="bold white")
-    debug_table.add_column("System", style="italic cyan")
+    debug_table.add_column("System", style="italic blue")
 
     ops_id = debug_info.get('ops', 'N/A')
     crm_id = debug_info.get('crm', 'N/A')
     dwh_key = debug_info.get('dwh', 'Waiting...')
 
-    debug_table.add_row("1. Source (Ops)", ops_id, "PostgreSQL (Uber_ops)")
-    debug_table.add_row("2. Map Logic", f"{crm_id} (Modulo)", "Python Logic / Uber_CRM")
-    debug_table.add_row("3. Warehouse", dwh_key, "FactTrip (Auto Increment)")
+    debug_table.add_row("1. Source (Ops)", ops_id, "PostgreSQL")
+    debug_table.add_row("2. Map Logic", f"{crm_id} (Modulo)", "Python")
+    debug_table.add_row("3. Warehouse", dwh_key, "FactTrip")
 
-    # 3. Status Panel
-    status_panel = Panel(
-        status, 
-        title="[bold]🔄 Current Status[/bold]", 
-        border_style="cyan" if last_error == "None" else "red"
-    )
+    status_panel = Panel(status, title="[bold]🔄 Status[/bold]", border_style="blue" if last_error == "None" else "red")
     
-    # 4. TẠO LAYOUT CHÍNH (SỬA LỖI TYPEERROR)
     main_layout = Layout()
-    
-    # Chia layout theo cột dọc (split_column)
-    # Danh sách các phần tử cần hiển thị
     layout_elements = [
-        Layout(grid, size=5),          # Phần thống kê
-        Layout(status_panel, size=3),  # Phần trạng thái
-        Layout(Panel(debug_table, title="🔍 [bold magenta]ID TRACING (Live Sample)[/bold magenta]", border_style="magenta"), size=9) # Phần debug
+        Layout(grid, size=5),
+        Layout(status_panel, size=3),
+        Layout(Panel(debug_table, title="🔍 [bold magenta]ID TRACING[/bold magenta]", border_style="magenta"), size=9)
     ]
     
-    # Nếu có lỗi, thêm Panel lỗi vào cuối
     if last_error != "None":
         error_panel = Panel(f"[red]{last_error}[/red]", title="❌ Last Error", border_style="red")
         layout_elements.append(Layout(error_panel, size=5))
 
-    # Thực hiện chia
     main_layout.split_column(*layout_elements)
-
-    # Bọc tất cả trong Panel khung
-    return Panel(
-        main_layout, 
-        title="ETL CONSUMER MONITOR", 
-        border_style="yellow"
-    )
+    return Panel(main_layout, title="ETL CONSUMER MONITOR", border_style="blue")
 
 def consumer():
     total_processed = 0
@@ -294,39 +292,53 @@ def consumer():
                     r_client.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
                     continue
 
-                # Xử lý và nhận lại debug info
+                # 1. Transform (Lookup & Rename)
                 df_fact, sample_debug = process_batch_data(df_batch)
-                
-                # Cập nhật Debug Info từ Python
                 debug_info.update(sample_debug)
 
-                if not df_fact.empty:
+                # 2. DEDUPLICATION (Lọc trùng)
+                df_load = filter_existing_trips(df_fact, engine_dwh)
+                
+                duplicate_count = len(df_fact) - len(df_load)
+                
+                if not df_load.empty:
                     with engine_dwh.begin() as conn:
-                        df_fact.to_sql('facttrip', conn, if_exists='append', index=False)
+                        df_load.to_sql('facttrip', conn, if_exists='append', index=False)
                         
-                        # Query lấy Max Key thực tế trong DB để hiển thị
                         try:
                             max_key = conn.execute(text("SELECT MAX(TripKey) FROM FactTrip")).scalar()
                             debug_info["dwh"] = f"{max_key:,}"
-                        except:
-                            debug_info["dwh"] = "N/A"
+                        except: pass
 
-                    # Update Stats
-                    total_processed += len(df_fact)
-                    if 'averagerating' in df_fact.columns:
-                        last_rating = f"{df_fact['averagerating'].mean():.2f}"
-                    if 'fareamount' in df_fact.columns:
-                        last_fare = f"{df_fact['fareamount'].mean():.2f}"
+                    total_processed += len(df_load)
+                    if 'averagerating' in df_load.columns:
+                        last_rating = f"{df_load['averagerating'].mean():.2f}"
+                    if 'fareamount' in df_load.columns:
+                        last_fare = f"{df_load['fareamount'].mean():.2f}"
                     
-                    status_msg = f"[bold green]✅ Success (+{len(df_fact)})[/bold green]"
+                    status_msg = f"[bold green]✅ Loaded {len(df_load)}[/bold green] (Dup: {duplicate_count})"
+                else:
+                    status_msg = f"[bold yellow]⚠️ Skipped (All {duplicate_count} Duplicated)[/bold yellow]"
                 
+                # 1. Xác nhận đã xử lý (Logic Group)
                 r_client.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
+                
+                # 2. XÓA TIN NHẮN KHỎI STREAM (Logic Memory) <--- THÊM DÒNG NÀY
+                # Để giảm counter XLEN cho Producer chạy tiếp
+                r_client.xdel(STREAM_KEY, *msg_ids)
+
                 last_error = "None"
                 live.update(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info))
                 
             except Exception as e:
-                last_error = str(e)[0:200]
-                status_msg = "[bold red]❌ Error[/bold red]"
+                # Nếu lỗi unique constraint (trường hợp hiếm hoi bị race condition), ta vẫn ACK để bỏ qua
+                if "unique constraint" in str(e).lower():
+                    status_msg = "[bold yellow]⚠️ Database Constraint Skip[/bold yellow]"
+                    r_client.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
+                else:
+                    last_error = str(e)[0:200]
+                    status_msg = "[bold red]❌ Error[/bold red]"
+                
                 live.update(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info))
                 time.sleep(5)
 
