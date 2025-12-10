@@ -4,13 +4,25 @@ import numpy as np
 from sqlalchemy import text
 from etl_config import r_client, engine_dwh, engine_crm, STREAM_KEY, GROUP_NAME, CONSUMER_NAME
 
+# --- THƯ VIỆN GIAO DIỆN RICH ---
+from rich.live import Live
+from rich.table import Table
+from rich.console import Console
+from rich.panel import Panel
+from rich.layout import Layout
+from rich import box
+from datetime import datetime
+
 # Tạo Consumer Group
 try:
     r_client.xgroup_create(STREAM_KEY, GROUP_NAME, id='0', mkstream=True)
 except:
     pass
 
-# --- HÀM 1: BULK LOOKUP KEYS (DIMENSIONS) ---
+# ==============================================================================
+# 1. CÁC HÀM XỬ LÝ LOGIC (KHÔNG ĐỔI)
+# ==============================================================================
+
 def get_lookup_map(id_list, table_name, id_col, key_col):
     if not id_list: return {}
     valid_ids = [str(x) for x in id_list if x and str(x) != 'nan' and str(x) != '0' and str(x) != '-1']
@@ -27,10 +39,8 @@ def get_lookup_map(id_list, table_name, id_col, key_col):
             lookup_df = pd.read_sql(sql, conn)
         return dict(zip(lookup_df[id_col].astype(str), lookup_df[key_col]))
     except Exception as e:
-        print(f"⚠️ Lỗi lookup {table_name}: {e}")
         return {}
 
-# --- HÀM 2: LẤY PROMO TỪ CRM ---
 def get_promo_from_crm(real_trip_ids):
     if not real_trip_ids: return {}
     
@@ -64,22 +74,11 @@ def get_promo_from_crm(real_trip_ids):
                 final_map[rid] = short_to_promo[sid]
         return final_map
     except Exception as e:
-        print(f"⚠️ Lỗi lookup CRM Feedback: {e}")
         return {}
 
-# --- HÀM 3: LẤY DRIVER PERFORMANCE TỪ CRM (MỚI THÊM) ---
 def get_driver_performance(df_batch):
-    """
-    Lấy AverageRating và AcceptanceRate từ bảng driver_performance (CRM)
-    Dựa vào driver_id và tháng của chuyến đi.
-    """
     if df_batch.empty: return df_batch
-
-    # 1. Tạo cột 'month_key' dạng 'YYYY-MM-01' để khớp với period_date trong DB
-    # df_batch['tpep_pickup_datetime'] đã được convert sang datetime ở bước trước
     df_batch['temp_period'] = df_batch['tpep_pickup_datetime'].dt.to_period('M').dt.to_timestamp().dt.strftime('%Y-%m-%d')
-    
-    # Lấy danh sách driver và các tháng cần query
     drivers = df_batch['driver_id'].unique().tolist()
     periods = df_batch['temp_period'].unique().tolist()
     
@@ -88,12 +87,10 @@ def get_driver_performance(df_batch):
     drivers_str = ",".join([str(x) for x in drivers if str(x) != 'nan'])
     periods_str = ",".join([f"'{x}'" for x in periods])
     
-    # 2. Query CRM
     sql = text(f"""
         SELECT driver_id, period_date, average_rating, acceptance_rate
         FROM driver_performance
-        WHERE driver_id IN ({drivers_str})
-          AND period_date IN ({periods_str})
+        WHERE driver_id IN ({drivers_str}) AND period_date IN ({periods_str})
     """)
     
     try:
@@ -105,37 +102,36 @@ def get_driver_performance(df_batch):
             df_batch['AcceptanceRate'] = None
             return df_batch
 
-        # 3. Chuẩn hóa để Merge
         df_perf['period_date'] = pd.to_datetime(df_perf['period_date']).dt.strftime('%Y-%m-%d')
         df_perf['driver_id'] = df_perf['driver_id'].astype(str)
-        
-        # Tạo key để map: "driver_id|YYYY-MM-DD"
         df_perf['join_key'] = df_perf['driver_id'] + "|" + df_perf['period_date']
         df_batch['join_key'] = df_batch['driver_id'].astype(str) + "|" + df_batch['temp_period']
         
-        # Map dữ liệu vào Dictionary
         rating_map = dict(zip(df_perf['join_key'], df_perf['average_rating']))
         acceptance_map = dict(zip(df_perf['join_key'], df_perf['acceptance_rate']))
         
-        # 4. Map vào DataFrame chính
         df_batch['AverageRating'] = df_batch['join_key'].map(rating_map)
         df_batch['AcceptanceRate'] = df_batch['join_key'].map(acceptance_map)
-        
-        # Dọn dẹp cột tạm
         df_batch.drop(columns=['temp_period', 'join_key'], inplace=True, errors='ignore')
         
     except Exception as e:
-        print(f"⚠️ Lỗi lookup Driver Performance: {e}")
         df_batch['AverageRating'] = None
         df_batch['AcceptanceRate'] = None
         
     return df_batch
 
-# --- HÀM 4: XỬ LÝ BATCH ---
 def process_batch_data(df):
+    sample_debug = {}
     df.columns = [c.lower() for c in df.columns]
     
-    # Convert Datetime & Numeric
+    if not df.empty:
+        try:
+            ops_id = str(df.iloc[0]['trip_id'])
+            crm_id = str(int(ops_id) % 10_000_000)
+            sample_debug = {"ops": ops_id, "crm": crm_id}
+        except:
+            sample_debug = {"ops": "N/A", "crm": "N/A"}
+
     df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'], errors='coerce')
     df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'], errors='coerce')
     
@@ -144,14 +140,11 @@ def process_batch_data(df):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
-    # Tính toán
     df['DateKey'] = df['tpep_pickup_datetime'].dt.strftime('%Y%m%d').astype(int)
     df['TripDuration'] = (df['tpep_dropoff_datetime'] - df['tpep_pickup_datetime']).dt.total_seconds().fillna(0).astype(int)
 
-    # 1. LẤY DRIVER PERFORMANCE (Logic Mới)
     df = get_driver_performance(df)
 
-    # 2. LOOKUP KEYS
     unique_drivers = df['driver_id'].astype(str).unique().tolist()
     unique_customers = df['customer_id'].astype(str).unique().tolist()
     unique_vehicles = df['vehicle_id'].astype(str).unique().tolist()
@@ -168,7 +161,6 @@ def process_batch_data(df):
     unique_promo_ids = df['temp_promo_id'].dropna().unique().tolist()
     promo_key_map = get_lookup_map(unique_promo_ids, 'DimPromotion', 'promotionid', 'promotionkey')
 
-    # Mapping
     df['DriverKey'] = df['driver_id'].astype(str).map(driver_map).fillna(-1).astype(int)
     df['CustomerKey'] = df['customer_id'].astype(str).map(customer_map).fillna(-1).astype(int)
     df['VehicleKey'] = df['vehicle_id'].astype(str).map(vehicle_map).fillna(-1).astype(int)
@@ -176,9 +168,8 @@ def process_batch_data(df):
     df['DropoffLocationKey'] = df['dolocationid'].astype(str).map(location_map).fillna(-1).astype(int)
     df['PromotionKey'] = df['temp_promo_id'].map(promo_key_map).fillna(-1).astype(int)
 
-    # 3. PREPARE FINAL DF
     final_rename = {
-        'trip_id':'sourcetripid',
+        'trip_id': 'sourcetripid',
         'DateKey': 'datekey',
         'PickupLocationKey': 'pickuplocationkey',
         'DropoffLocationKey': 'dropofflocationkey',
@@ -196,50 +187,148 @@ def process_batch_data(df):
         'congestion_surcharge': 'congestionsurcharge',
         'trip_distance': 'tripdistance',
         'TripDuration': 'tripduration',
-        'AverageRating': 'averagerating',       # Cột mới
-        'AcceptanceRate': 'acceptancerate'      # Cột mới
+        'AverageRating': 'averagerating',
+        'AcceptanceRate': 'acceptancerate'
     }
     
     df = df.rename(columns=final_rename)
     target_cols = list(final_rename.values())
-    # Chỉ lấy cột có trong DF
     available_cols = [c for c in target_cols if c in df.columns]
     
-    return df[available_cols]
+    return df[available_cols], sample_debug
+
+# ==============================================================================
+# 2. GIAO DIỆN DASHBOARD (RICH) - ĐÃ SỬA LỖI LAYOUT
+# ==============================================================================
+def generate_dashboard(total, last_rating, last_fare, status, last_error, debug_info):
+    # 1. Bảng Main Stats
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    
+    grid.add_row(
+        Panel(f"[bold green]{total:,}[/bold green]", title="🚀 Total Processed", border_style="green"),
+        Panel(f"[bold yellow]{last_rating}[/bold yellow]", title="⭐ Avg Rating (Batch)", border_style="yellow"),
+        Panel(f"[bold cyan]${last_fare}[/bold cyan]", title="💰 Avg Fare (Batch)", border_style="cyan"),
+    )
+
+    # 2. Bảng Debug ID
+    debug_table = Table(show_header=True, expand=True, box=box.SIMPLE)
+    debug_table.add_column("Level", style="dim")
+    debug_table.add_column("ID / Key", style="bold white")
+    debug_table.add_column("System", style="italic cyan")
+
+    ops_id = debug_info.get('ops', 'N/A')
+    crm_id = debug_info.get('crm', 'N/A')
+    dwh_key = debug_info.get('dwh', 'Waiting...')
+
+    debug_table.add_row("1. Source (Ops)", ops_id, "PostgreSQL (Uber_ops)")
+    debug_table.add_row("2. Map Logic", f"{crm_id} (Modulo)", "Python Logic / Uber_CRM")
+    debug_table.add_row("3. Warehouse", dwh_key, "FactTrip (Auto Increment)")
+
+    # 3. Status Panel
+    status_panel = Panel(
+        status, 
+        title="[bold]🔄 Current Status[/bold]", 
+        border_style="cyan" if last_error == "None" else "red"
+    )
+    
+    # 4. TẠO LAYOUT CHÍNH (SỬA LỖI TYPEERROR)
+    main_layout = Layout()
+    
+    # Chia layout theo cột dọc (split_column)
+    # Danh sách các phần tử cần hiển thị
+    layout_elements = [
+        Layout(grid, size=5),          # Phần thống kê
+        Layout(status_panel, size=3),  # Phần trạng thái
+        Layout(Panel(debug_table, title="🔍 [bold magenta]ID TRACING (Live Sample)[/bold magenta]", border_style="magenta"), size=9) # Phần debug
+    ]
+    
+    # Nếu có lỗi, thêm Panel lỗi vào cuối
+    if last_error != "None":
+        error_panel = Panel(f"[red]{last_error}[/red]", title="❌ Last Error", border_style="red")
+        layout_elements.append(Layout(error_panel, size=5))
+
+    # Thực hiện chia
+    main_layout.split_column(*layout_elements)
+
+    # Bọc tất cả trong Panel khung
+    return Panel(
+        main_layout, 
+        title="ETL CONSUMER MONITOR", 
+        border_style="yellow"
+    )
 
 def consumer():
-    print("📥 [CONSUMER] Bắt đầu lắng nghe Redis...")
-    while True:
-        try:
-            entries = r_client.xreadgroup(GROUP_NAME, CONSUMER_NAME, {STREAM_KEY: ">"}, count=1000, block=2000)
-            if not entries: continue
+    total_processed = 0
+    last_rating = "0.0"
+    last_fare = "0.0"
+    status_msg = "[grey]Waiting for stream...[/grey]"
+    last_error = "None"
+    debug_info = {"ops": "...", "crm": "...", "dwh": "..."}
 
-            stream, messages = entries[0]
-            print(f"⚡ Xử lý {len(messages)} dòng...")
+    with Live(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info), refresh_per_second=4) as live:
+        while True:
+            try:
+                entries = r_client.xreadgroup(GROUP_NAME, CONSUMER_NAME, {STREAM_KEY: ">"}, count=1000, block=2000)
+                
+                if not entries:
+                    status_msg = "[grey]💤 Idle...[/grey]"
+                    live.update(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info))
+                    continue
 
-            rows = []
-            msg_ids = []
-            for msg_id, data in messages:
-                rows.append(data)
-                msg_ids.append(msg_id)
-            
-            df_batch = pd.DataFrame(rows)
-            if df_batch.empty:
+                stream, messages = entries[0]
+                status_msg = f"[bold blue]⚡ Processing {len(messages)} rows...[/bold blue]"
+                live.update(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info))
+
+                rows = []
+                msg_ids = []
+                for msg_id, data in messages:
+                    rows.append(data)
+                    msg_ids.append(msg_id)
+                
+                df_batch = pd.DataFrame(rows)
+                
+                if df_batch.empty:
+                    r_client.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
+                    continue
+
+                # Xử lý và nhận lại debug info
+                df_fact, sample_debug = process_batch_data(df_batch)
+                
+                # Cập nhật Debug Info từ Python
+                debug_info.update(sample_debug)
+
+                if not df_fact.empty:
+                    with engine_dwh.begin() as conn:
+                        df_fact.to_sql('facttrip', conn, if_exists='append', index=False)
+                        
+                        # Query lấy Max Key thực tế trong DB để hiển thị
+                        try:
+                            max_key = conn.execute(text("SELECT MAX(TripKey) FROM FactTrip")).scalar()
+                            debug_info["dwh"] = f"{max_key:,}"
+                        except:
+                            debug_info["dwh"] = "N/A"
+
+                    # Update Stats
+                    total_processed += len(df_fact)
+                    if 'averagerating' in df_fact.columns:
+                        last_rating = f"{df_fact['averagerating'].mean():.2f}"
+                    if 'fareamount' in df_fact.columns:
+                        last_fare = f"{df_fact['fareamount'].mean():.2f}"
+                    
+                    status_msg = f"[bold green]✅ Success (+{len(df_fact)})[/bold green]"
+                
                 r_client.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
-                continue
-
-            df_fact = process_batch_data(df_batch)
-            
-            if not df_fact.empty:
-                with engine_dwh.begin() as conn:
-                    df_fact.to_sql('facttrip', conn, if_exists='append', index=False)
-                print(f"✅ Đã nạp {len(df_fact)} dòng. (Rating: {df_fact['averagerating'].iloc[0]})")
-            
-            r_client.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
-            
-        except Exception as e:
-            print(f"❌ [CONSUMER] Lỗi: {e}")
-            time.sleep(5)
+                last_error = "None"
+                live.update(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info))
+                
+            except Exception as e:
+                last_error = str(e)[0:200]
+                status_msg = "[bold red]❌ Error[/bold red]"
+                live.update(generate_dashboard(total_processed, last_rating, last_fare, status_msg, last_error, debug_info))
+                time.sleep(5)
 
 if __name__ == "__main__":
     consumer()

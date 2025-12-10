@@ -8,3 +8,4 @@ geopandas
 redis
 taipy
 plotly
+rich
