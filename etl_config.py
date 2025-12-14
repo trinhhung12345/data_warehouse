@@ -3,7 +3,7 @@ from sqlalchemy import create_engine
 import redis
 
 # --- CẤU HÌNH IP & PORT ---
-SERVER_IP = "100.117.51.34" # IP Tailscale của bạn
+SERVER_IP = "100.102.253.78" # IP Tailscale của bạn
 REDIS_PORT = 6379
 REDIS_PASS = "hung12345"
 

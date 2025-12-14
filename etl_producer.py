@@ -15,7 +15,11 @@ from rich import box
 
 LAST_ID_KEY = "etl:state:last_trip_id"
 BATCH_SIZE = 1000
-MAX_PENDING_SIZE = 50000  # <--- GIỚI HẠN AN TOÀN: Chỉ cho phép tối đa 50k tin chờ
+
+# CẤU HÌNH NGƯỠNG AN TOÀN
+THRESHOLD_WARNING = 50000   # Bắt đầu phanh nhẹ
+THRESHOLD_CRITICAL = 100000 # Phanh gấp
+MAX_SAFETY_CAP = 200000     # Giới hạn cứng để không sập Redis (Consumer quá chậm thì chấp nhận mất)
 
 # ==============================================================================
 # 1. HÀM TẠO GIAO DIỆN COMPACT
@@ -27,14 +31,14 @@ def generate_dashboard(total_pushed, last_id, batch_range, status, last_error, p
     grid.add_column(justify="center", ratio=1)
     grid.add_column(justify="center", ratio=1)
     
-    # Màu của Pending: Xanh (ít) -> Đỏ (đầy)
+    # Màu sắc Pending
     pending_color = "green"
-    if pending_count > MAX_PENDING_SIZE * 0.8: pending_color = "red"
-    elif pending_count > MAX_PENDING_SIZE * 0.5: pending_color = "yellow"
+    if pending_count > THRESHOLD_CRITICAL: pending_color = "red"
+    elif pending_count > THRESHOLD_WARNING: pending_color = "yellow"
 
     grid.add_row(
         Panel(f"[bold green]{total_pushed:,}[/bold green]", title="📦 Total Pushed", border_style="green"),
-        Panel(f"[bold {pending_color}]{pending_count:,}[/bold {pending_color}] / {MAX_PENDING_SIZE}", title="⏳ Redis Queue", border_style=pending_color),
+        Panel(f"[bold {pending_color}]{pending_count:,}[/bold {pending_color}]", title="⏳ Queue Size", border_style=pending_color),
         Panel(f"[bold cyan]{last_id}[/bold cyan]", title="🔖 Cursor", border_style="cyan"),
     )
 
@@ -51,13 +55,13 @@ def generate_dashboard(total_pushed, last_id, batch_range, status, last_error, p
     status_style = "blue"
     if "Idle" in status: status_style = "grey50"
     if "Error" in status: status_style = "red"
-    if "Full" in status: status_style = "yellow" # Trạng thái mới: Full
+    if "Slowing" in status: status_style = "yellow"
 
     status_panel = Panel(status, title="[bold]Status[/bold]", border_style=status_style)
 
     # 4. Header
     header = Panel(
-        f"[bold white]ETL PRODUCER (Smart Flow)[/bold white] | [dim]{datetime.now().strftime('%H:%M:%S')}[/dim]",
+        f"[bold white]ETL PRODUCER (Safe Mode)[/bold white] | [dim]{datetime.now().strftime('%H:%M:%S')}[/dim]",
         style="blue", box=box.HEAVY_HEAD
     )
 
@@ -78,15 +82,15 @@ def generate_dashboard(total_pushed, last_id, batch_range, status, last_error, p
     return layout
 
 # ==============================================================================
-# 2. HÀM CHÍNH (SMART PRODUCER)
+# 2. HÀM CHÍNH (SAFE PRODUCER)
 # ==============================================================================
 def producer():
     console = Console()
     console.clear() 
     
     total_pushed = 0
-    last_id = r_client.get(LAST_ID_KEY)
-    last_id = int(last_id) if last_id else 0
+    last_id_redis = r_client.get(LAST_ID_KEY)
+    last_id = int(last_id_redis) if last_id_redis else 0
     
     batch_range = ("N/A", "N/A")
     status_msg = "[grey]Initializing...[/grey]"
@@ -100,16 +104,25 @@ def producer():
         
         while True:
             try:
-                # --- CHECK 1: BACKPRESSURE CONTROL ---
-                # Kiểm tra độ dài hàng đợi trong Redis
+                # --- CHECK 1: SMART THROTTLING (PHANH THÔNG MINH) ---
                 pending_count = r_client.xlen(STREAM_KEY)
                 
-                # Nếu Redis đang gánh quá nhiều (> 50k tin), Producer tạm dừng
-                if pending_count >= MAX_PENDING_SIZE:
-                    status_msg = f"[bold yellow]✋ Queue Full ({pending_count:,}). Pausing 2s...[/bold yellow]"
+                # Logic điều chỉnh tốc độ
+                sleep_duration = 0
+                
+                if pending_count > THRESHOLD_CRITICAL:
+                    # Nguy hiểm: Ngủ lâu để Consumer dọn dẹp
+                    status_msg = f"[bold red]✋ Queue High ({pending_count:,}). Slowing down 5s...[/bold red]"
+                    sleep_duration = 5
+                elif pending_count > THRESHOLD_WARNING:
+                    # Cảnh báo: Ngủ nhẹ
+                    status_msg = f"[bold yellow]⚠️ Queue Warning ({pending_count:,}). Throttling 1s...[/bold yellow]"
+                    sleep_duration = 1
+                
+                # Cập nhật giao diện nếu đang bị delay
+                if sleep_duration > 0:
                     live.update(generate_dashboard(total_pushed, last_id, batch_range, status_msg, last_error, pending_count))
-                    time.sleep(2)
-                    continue # Bỏ qua vòng lặp này, không query DB nữa
+                    time.sleep(sleep_duration)
 
                 # --- GIAI ĐOẠN 2: SCANNING ---
                 status_msg = f"[bold yellow]🔍 Scanning > {last_id}...[/bold yellow]"
@@ -133,7 +146,7 @@ def producer():
                 """)
                 
                 with engine_ops.connect() as conn:
-                    df = pd.read_sql(sql, conn, params={"last_id": last_id, "batch_size": BATCH_SIZE})
+                    df = pd.read_sql(sql, conn, params={"last_id": int(last_id), "batch_size": BATCH_SIZE})
 
                 if df.empty:
                     status_msg = "[grey]💤 Idle. Waiting 5s...[/grey]"
@@ -160,19 +173,22 @@ def producer():
                             data[k] = ""
                         else:
                             data[k] = str(v)
-                    pipeline.xadd(STREAM_KEY, data)
+                    
+                    # 🔥 CẤU HÌNH AN TOÀN: 
+                    # Vẫn dùng maxlen nhưng để rất lớn (200k) để tránh sập RAM
+                    # Logic Throttling ở trên sẽ giữ queue không bao giờ chạm tới mức này
+                    pipeline.xadd(STREAM_KEY, data, maxlen=MAX_SAFETY_CAP, approximate=True)
 
                 pipeline.execute()
                 
-                r_client.set(LAST_ID_KEY, int(current_max_id))
-                last_id = int(current_max_id)
+                last_id = int(current_max_id) 
+                r_client.set(LAST_ID_KEY, last_id)
                 total_pushed += len(df)
                 
-                # --- GIAI ĐOẠN 4: SUCCESS ---
                 status_msg = f"[bold green]✅ Pushed (+{len(df)})[/bold green]"
                 last_error = "None"
-                # Cập nhật lại số pending để hiển thị chính xác
-                pending_count += len(df) 
+                # Cập nhật lại pending count ước tính
+                pending_count += len(df)
                 live.update(generate_dashboard(total_pushed, last_id, batch_range, status_msg, last_error, pending_count))
                 
             except Exception as e:
