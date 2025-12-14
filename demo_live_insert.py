@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, text
 from datetime import datetime
 
 # Kết nối vào Source (Ops)
-DB_OPS_URL = "postgresql://postgres:hung12345@100.117.51.34:5433/Uber_ops"
+DB_OPS_URL = "postgresql://postgres:hung12345@100.102.253.78:5433/Uber_ops"
 engine_ops = create_engine(DB_OPS_URL)
 
 def generate_fake_trip():
@@ -14,6 +14,12 @@ def generate_fake_trip():
         max_id = conn.execute(text("SELECT MAX(trip_id) FROM trips")).scalar()
     
     new_id = int(max_id) + 1
+
+    random_day = random.randint(1, 31)
+    random_hour = random.randint(0, 23)
+    random_minute = random.randint(0, 59)
+    pickup_time = datetime(2025, 7, random_day, random_hour, random_minute)
+    dropoff_time = datetime(2025, 7, random_day, random_hour + random.randint(0, 1), (random_minute + random.randint(5, 30)) % 60)
     
     # Tạo data giả (Lấy Driver/Customer ID nhỏ để chắc chắn đã có trong Dim)
     trip = {
@@ -21,8 +27,8 @@ def generate_fake_trip():
         'driver_id': random.randint(1, 100),
         'customer_id': random.randint(1, 1000),
         'vendorid': 1,
-        'tpep_pickup_datetime': datetime.now(), # Thời gian thực
-        'tpep_dropoff_datetime': datetime.now(),
+        'tpep_pickup_datetime': pickup_time,
+        'tpep_dropoff_datetime': dropoff_time,
         'passenger_count': 1,
         'trip_distance': round(random.uniform(1.0, 10.0), 2),
         'ratecodeid': 1,
